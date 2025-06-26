@@ -17,8 +17,8 @@ Servo servoLeft;
 Servo servoRight;
 
 // Servo control pins (signal pins)
-const int SERVO_LEFT_PIN  = 0;
-const int SERVO_RIGHT_PIN = 1;
+const int SERVO_LEFT_PIN  = D0;
+const int SERVO_RIGHT_PIN = D1;
 
 // Pulse widths for continuous rotation servos
 const int SERVO_STOP  = 90;   // 1.5 ms pulse = stop
