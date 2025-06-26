@@ -2,6 +2,7 @@
 #include <WebServer.h>
 #include <WebSocketsServer.h>
 #include <ESP32Servo.h>         // ESP32 Servo library
+#include <Preferences.h>        // For storing calibration offsets
 
 // WiFi credentials
 const char* ssid     = "YungHub";
@@ -16,19 +17,47 @@ WebSocketsServer webSocket(81);
 Servo servoLeft;
 Servo servoRight;
 
+// Preferences for calibration storage
+typedef Preferences Prefs;
+Prefs prefs;
+
+// Calibration offsets (in degrees)
+int leftOffset  = 0;
+int rightOffset = 0;
+
 // Servo control pins (signal pins)
 const int SERVO_LEFT_PIN  = D0;
 const int SERVO_RIGHT_PIN = D1;
 
-// Pulse widths for continuous rotation servos
-const int SERVO_STOP  = 90;   // 1.5 ms pulse = stop
-const int SERVO_FASTF = 135;  // faster forward
-const int SERVO_FASTB = 45;   // faster backward
+// SR04 ultrasonic sensor pins
+const int SR04_TRIG_PIN = D3;
+const int SR04_ECHO_PIN = D2;
+
+// Base pulse widths for continuous rotation servos
+const int SERVO_CENTER = 90;   // nominal stop position
+const int SERVO_FASTF  = 135;  // faster forward
+const int SERVO_FASTB  = 45;   // faster backward
+
+// Compute effective positions using offsets
+inline int posCenter(int offset) { return SERVO_CENTER + offset; }
+inline int posFastF (int offset) { return SERVO_FASTF  + offset; }
+inline int posFastB (int offset) { return SERVO_FASTB  + offset; }
+
+// Read distance from SR04 (in cm)
+long readUltrasonicCM() {
+  digitalWrite(SR04_TRIG_PIN, LOW);
+  delayMicroseconds(2);
+  digitalWrite(SR04_TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(SR04_TRIG_PIN, LOW);
+  long duration = pulseIn(SR04_ECHO_PIN, HIGH, 30000); // timeout 30ms
+  long distance = duration * 0.034 / 2;
+  return distance;
+}
 
 // WebSocket event handler
 void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length) {
   if (type == WStype_TEXT) {
-    // Read up to 3 characters of command
     char buf[4] = {0};
     memcpy(buf, payload, min(length, sizeof(buf) - 1));
     uint8_t cmd = atoi(buf);
@@ -42,29 +71,29 @@ void sendServoCommand(uint8_t cmd) {
   Serial.printf("Servo cmd: %u\n", cmd);
   switch (cmd) {
     case 1: // forward: both servos forward
-      servoLeft.write(SERVO_FASTF);
-      servoRight.write(SERVO_FASTF);
+      servoLeft.write(posFastF(leftOffset));
+      servoRight.write(posFastF(rightOffset));
       break;
     case 2: // backward: both servos backward
-      servoLeft.write(SERVO_FASTB);
-      servoRight.write(SERVO_FASTB);
+      servoLeft.write(posFastB(leftOffset));
+      servoRight.write(posFastB(rightOffset));
       break;
     case 3: // turn left: left backward, right forward
-      servoLeft.write(SERVO_FASTB);
-      servoRight.write(SERVO_FASTF);
+      servoLeft.write(posFastB(leftOffset));
+      servoRight.write(posFastF(rightOffset));
       break;
     case 4: // turn right: left forward, right backward
-      servoLeft.write(SERVO_FASTF);
-      servoRight.write(SERVO_FASTB);
+      servoLeft.write(posFastF(leftOffset));
+      servoRight.write(posFastB(rightOffset));
       break;
     default: // stop
-      servoLeft.write(SERVO_STOP);
-      servoRight.write(SERVO_STOP);
+      servoLeft.write(posCenter(leftOffset));
+      servoRight.write(posCenter(rightOffset));
       break;
   }
 }
 
-// HTML page to serve
+// HTML page to serve (unchanged)
 const char* htmlPage = R"rawliteral(
 <!DOCTYPE html>
 <html>
@@ -104,6 +133,22 @@ void handleRoot() {
 void setup() {
   Serial.begin(115200);
 
+  // Load calibration offsets
+  prefs.begin("servoCalib", false);
+  leftOffset  = prefs.getInt("leftOffset", 0);
+  rightOffset = prefs.getInt("rightOffset", 0);
+  Serial.printf("Loaded calibration: leftOffset=%d, rightOffset=%d\n", leftOffset, rightOffset);
+
+  // Provide calibration instructions over Serial
+  Serial.println("Calibration commands:");
+  Serial.println("  L/l : increase/decrease left offset");
+  Serial.println("  R/r : increase/decrease right offset");
+  Serial.println("  S   : save offsets to flash");
+
+  // Initialize SR04 pins
+  pinMode(SR04_TRIG_PIN, OUTPUT);
+  pinMode(SR04_ECHO_PIN, INPUT);
+
   // Connect to WiFi
   WiFi.begin(ssid, password);
   Serial.print("Connecting to WiFi");
@@ -132,6 +177,38 @@ void setup() {
 }
 
 void loop() {
+  // Handle network
   server.handleClient();
   webSocket.loop();
+
+  // Serial-based calibration input
+  if (Serial.available()) {
+    char c = Serial.read();
+    bool changed = false;
+    switch (c) {
+      case 'L': leftOffset++; changed = true; break;
+      case 'l': leftOffset--; changed = true; break;
+      case 'R': rightOffset++; changed = true; break;
+      case 'r': rightOffset--; changed = true; break;
+      case 'S':
+        prefs.putInt("leftOffset", leftOffset);
+        prefs.putInt("rightOffset", rightOffset);
+        Serial.println("Calibration saved.");
+        break;
+    }
+    if (changed) {
+      Serial.printf("Offsets updated: left=%d, right=%d\n", leftOffset, rightOffset);
+      // Apply new stop immediately
+      sendServoCommand(0);
+    }
+  }
+
+  // Periodically read and print SR04 distance
+  static unsigned long lastRead = 0;
+  if (millis() - lastRead > 500) {
+    lastRead = millis();
+    long dist = readUltrasonicCM();
+    if(dist > 0) Serial.printf("Distance: %ld cm\n", dist);
+    else       Serial.println("Distance: out of range");
+  }
 }
