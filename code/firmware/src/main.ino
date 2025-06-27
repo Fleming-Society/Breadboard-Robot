@@ -1,99 +1,67 @@
 #include <WiFi.h>
 #include <WebServer.h>
 #include <WebSocketsServer.h>
-#include <ESP32Servo.h>         // ESP32 Servo library
-#include <Preferences.h>        // For storing calibration offsets
+#include <ESP32Servo.h>
+#include <Preferences.h>
 
-// WiFi credentials
+// ==== Function Prototypes ====
+void stopMotors();
+void sendServoCommand(uint8_t cmd);
+void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length);
+float readDistance();
+void checkButton();
+void handleDistanceMode();
+void handleLineFollowMode();
+
+// ==== WiFi Credentials ====
 const char* ssid     = "YungHub";
 const char* password = "yungyung";
 
-// HTTP server on port 80
-WebServer server(80);
-// WebSocket server on port 81
-WebSocketsServer webSocket(81);
+// ==== Pin Definitions ====
+const int SERVO_LEFT_PIN   = D0;
+const int SERVO_RIGHT_PIN  = D1;
+const int SR04_TRIG_PIN    = D3;
+const int SR04_ECHO_PIN    = D2;
+const int BUTTON_PIN       = D4;  // Active-HIGH pushbutton
 
-// Servo objects
+// ==== Servo Setup ====
 Servo servoLeft;
 Servo servoRight;
 
-// Preferences for calibration storage
-typedef Preferences Prefs;
-Prefs prefs;
-
-// Calibration offsets (in degrees)
+// ==== Calibration Preferences ====
+Preferences prefs;
 int leftOffset  = 0;
 int rightOffset = 0;
 
-// Servo control pins (signal pins)
-const int SERVO_LEFT_PIN  = D0;
-const int SERVO_RIGHT_PIN = D1;
+// ==== Servo Positions ====
+const int SERVO_CENTER = 90;
+const int SERVO_FASTF  = 135;
+const int SERVO_FASTB  = 45;
 
-// SR04 ultrasonic sensor pins
-const int SR04_TRIG_PIN = D3;
-const int SR04_ECHO_PIN = D2;
-
-// Base pulse widths for continuous rotation servos
-const int SERVO_CENTER = 90;   // nominal stop position
-const int SERVO_FASTF  = 135;  // faster forward
-const int SERVO_FASTB  = 45;   // faster backward
-
-// Compute effective positions using offsets
 inline int posCenter(int offset) { return SERVO_CENTER + offset; }
 inline int posFastF (int offset) { return SERVO_FASTF  + offset; }
 inline int posFastB (int offset) { return SERVO_FASTB  + offset; }
 
-// Read distance from SR04 (in cm)
-long readUltrasonicCM() {
-  digitalWrite(SR04_TRIG_PIN, LOW);
-  delayMicroseconds(2);
-  digitalWrite(SR04_TRIG_PIN, HIGH);
-  delayMicroseconds(10);
-  digitalWrite(SR04_TRIG_PIN, LOW);
-  long duration = pulseIn(SR04_ECHO_PIN, HIGH, 30000); // timeout 30ms
-  long distance = duration * 0.034 / 2;
-  return distance;
-}
+// ==== Modes ====
+enum Mode { MANUAL = 0, DISTANCE = 1, LINE_FOLLOW = 2 };
+Mode currentMode = MANUAL;
+const char* modeNames[] = { "MANUAL", "DISTANCE", "LINE FOLLOW" };
 
-// WebSocket event handler
-void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length) {
-  if (type == WStype_TEXT) {
-    char buf[4] = {0};
-    memcpy(buf, payload, min(length, sizeof(buf) - 1));
-    uint8_t cmd = atoi(buf);
-    sendServoCommand(cmd);
-  }
-}
+// ==== Timing ====
+unsigned long lastButtonPress = 0;
+const unsigned long debounceDelay = 300;
+unsigned long lastSensorTime = 0;
+const unsigned long sensorInterval = 200;
+#define SOUND_SPEED 0.034
+#define ECHO_TIMEOUT 30000
 
-// Map a command code to servo outputs
-// 1 = forward, 2 = backward, 3 = turn left, 4 = turn right, default = stop
-void sendServoCommand(uint8_t cmd) {
-  Serial.printf("Servo cmd: %u\n", cmd);
-  switch (cmd) {
-    case 1: // forward: both servos forward
-      servoLeft.write(posFastF(leftOffset));
-      servoRight.write(posFastF(rightOffset));
-      break;
-    case 2: // backward: both servos backward
-      servoLeft.write(posFastB(leftOffset));
-      servoRight.write(posFastB(rightOffset));
-      break;
-    case 3: // turn left: left backward, right forward
-      servoLeft.write(posFastB(leftOffset));
-      servoRight.write(posFastF(rightOffset));
-      break;
-    case 4: // turn right: left forward, right backward
-      servoLeft.write(posFastF(leftOffset));
-      servoRight.write(posFastB(rightOffset));
-      break;
-    default: // stop
-      servoLeft.write(posCenter(leftOffset));
-      servoRight.write(posCenter(rightOffset));
-      break;
-  }
-}
+int turnDirection = 0;
 
-// HTML page to serve (unchanged)
+// ==== Web Interfaces ====
+WebServer server(80);
+WebSocketsServer webSocket(81);
+
+// ==== HTML Page ====
 const char* htmlPage = R"rawliteral(
 <!DOCTYPE html>
 <html>
@@ -108,6 +76,7 @@ const char* htmlPage = R"rawliteral(
   </div>
   <div class="container">
     <h1>Omni Directional Robot Control</h1>
+    <p>Mode: <span id="modeName">MANUAL</span></p>
     <div class="row">
       <button id="btnUp"    onmousedown="buttonPress('1')" onmouseup="buttonRelease()" ontouchstart="buttonPress('1')" ontouchend="buttonRelease()">&#8679;</button>
     </div>
@@ -121,15 +90,23 @@ const char* htmlPage = R"rawliteral(
     </div>
   </div>
   <script src="https://raw.flemingsociety.com/robot/script.js"></script>
+  <script>
+    var ws = new WebSocket('ws://' + location.hostname + ':81');
+    ws.onopen = function() { console.log('WebSocket open'); };
+    ws.onmessage = function(msg) { console.log('Received: ' + msg.data); };
+    function buttonPress(cmd) {
+      ws.send(cmd);
+    }
+    function buttonRelease() {
+      ws.send('0');
+    }
+    // Update mode display via serial-over-websocket or polling (optional)
+  </script>
 </body>
 </html>
 )rawliteral";
 
-// Serve the control page
-void handleRoot() {
-  server.send(200, "text/html", htmlPage);
-}
-
+// ==== Setup ====
 void setup() {
   Serial.begin(115200);
 
@@ -139,47 +116,43 @@ void setup() {
   rightOffset = prefs.getInt("rightOffset", 0);
   Serial.printf("Loaded calibration: leftOffset=%d, rightOffset=%d\n", leftOffset, rightOffset);
 
-  // Provide calibration instructions over Serial
-  Serial.println("Calibration commands:");
+  // Calibration instructions
+  Serial.println("Calibration commands over Serial:");
   Serial.println("  L/l : increase/decrease left offset");
   Serial.println("  R/r : increase/decrease right offset");
   Serial.println("  S   : save offsets to flash");
+  Serial.println("Press button to cycle modes.");
 
-  // Initialize SR04 pins
+  // Pin config
+  pinMode(BUTTON_PIN, INPUT);
   pinMode(SR04_TRIG_PIN, OUTPUT);
   pinMode(SR04_ECHO_PIN, INPUT);
+
+  // Attach servos
+  servoLeft.attach(SERVO_LEFT_PIN);
+  servoRight.attach(SERVO_RIGHT_PIN);
+  stopMotors();
 
   // Connect to WiFi
   WiFi.begin(ssid, password);
   Serial.print("Connecting to WiFi");
   while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print('.');
+    delay(500); Serial.print('.');
   }
   Serial.printf("\nConnected! IP=%s\n", WiFi.localIP().toString().c_str());
 
-  // Start HTTP server
-  server.on("/", handleRoot);
+  // Web services
+  server.on("/", []() { server.send(200, "text/html", htmlPage); });
   server.begin();
-  Serial.println("HTTP server started.");
-
-  // Start WebSocket server
   webSocket.begin();
   webSocket.onEvent(webSocketEvent);
-  Serial.println("WebSocket server started.");
-
-  // Attach servos to pins
-  servoLeft.attach(SERVO_LEFT_PIN);
-  servoRight.attach(SERVO_RIGHT_PIN);
-
-  // Ensure servos are stopped at startup
-  sendServoCommand(0);
 }
 
+// ==== Loop ====
 void loop() {
-  // Handle network
   server.handleClient();
   webSocket.loop();
+  checkButton();
 
   // Serial-based calibration input
   if (Serial.available()) {
@@ -198,17 +171,120 @@ void loop() {
     }
     if (changed) {
       Serial.printf("Offsets updated: left=%d, right=%d\n", leftOffset, rightOffset);
-      // Apply new stop immediately
       sendServoCommand(0);
     }
   }
 
-  // Periodically read and print SR04 distance
-  static unsigned long lastRead = 0;
-  if (millis() - lastRead > 500) {
-    lastRead = millis();
-    long dist = readUltrasonicCM();
-    if(dist > 0) Serial.printf("Distance: %ld cm\n", dist);
-    else       Serial.println("Distance: out of range");
+  switch (currentMode) {
+    case DISTANCE:
+      handleDistanceMode();
+      break;
+    case MANUAL:
+      // Manual handled via WebSocket events
+      break;
+    case LINE_FOLLOW:
+      handleLineFollowMode();
+      break;
   }
+}
+
+// ==== Handle Pushbutton ====
+void checkButton() {
+  static bool lastState = LOW;
+  bool currentState = digitalRead(BUTTON_PIN);
+  if (currentState == HIGH && lastState == LOW && millis() - lastButtonPress > debounceDelay) {
+    currentMode = static_cast<Mode>((currentMode + 1) % 3);
+    Serial.printf("Mode changed to: %s\n", modeNames[currentMode]);
+    stopMotors();
+    lastButtonPress = millis();
+  }
+  lastState = currentState;
+}
+
+// ==== Distance Mode ====
+void handleDistanceMode() {
+  unsigned long now = millis();
+  if (now - lastSensorTime >= sensorInterval) {
+    lastSensorTime = now;
+    float distance = readDistance();
+    Serial.printf("Distance: %.2f cm\n", distance);
+    if (distance > 0 && distance < 5.0) {
+      // Too close: turn
+      if (turnDirection == 0) {
+        servoLeft.write(posFastB(leftOffset));
+        servoRight.write(posFastF(rightOffset));
+        Serial.println("← Turning LEFT");
+      } else {
+        servoLeft.write(posFastF(leftOffset));
+        servoRight.write(posFastB(rightOffset));
+        Serial.println("→ Turning RIGHT");
+      }
+    } else if (distance > 10.0) {
+      servoLeft.write(posFastF(leftOffset));
+      servoRight.write(posFastF(rightOffset));
+      Serial.println("↑ Moving FORWARD");
+      turnDirection = random(0, 2);
+    } else {
+      stopMotors();
+      Serial.println("Distance: No echo / too close");
+    }
+  }
+}
+
+// ==== Line Follow Mode (placeholder) ====
+void handleLineFollowMode() {
+  // TODO: Implement line following
+}
+
+// ==== WebSocket Events ====
+void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length) {
+  if (type == WStype_TEXT && currentMode == MANUAL) {
+    char buf[4] = {0};
+    memcpy(buf, payload, min(length, sizeof(buf)-1));
+    uint8_t cmd = atoi(buf);
+    sendServoCommand(cmd);
+  }
+}
+
+// ==== Servo Control ====
+void sendServoCommand(uint8_t cmd) {
+  switch (cmd) {
+    case 1: 
+      servoLeft.write(posFastF(leftOffset));
+      servoRight.write(posFastF(rightOffset));
+      break;
+    case 2: 
+      servoLeft.write(posFastB(leftOffset));
+      servoRight.write(posFastB(rightOffset));
+      break;
+    case 3: 
+      servoLeft.write(posFastB(leftOffset));
+      servoRight.write(posFastF(rightOffset));
+      break;
+    case 4: 
+      servoLeft.write(posFastF(leftOffset));
+      servoRight.write(posFastB(rightOffset));
+      break;
+    default:
+      stopMotors();
+      break;
+  }
+}
+
+// ==== Stop Motors ====
+void stopMotors() {
+  servoLeft.write(posCenter(leftOffset));
+  servoRight.write(posCenter(rightOffset));
+}
+
+// ==== Read Distance Sensor ====
+float readDistance() {
+  digitalWrite(SR04_TRIG_PIN, LOW);
+  delayMicroseconds(2);
+  digitalWrite(SR04_TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(SR04_TRIG_PIN, LOW);
+  long duration = pulseInLong(SR04_ECHO_PIN, HIGH, ECHO_TIMEOUT);
+  if (duration == 0) return -1.0;
+  return duration * SOUND_SPEED / 2;
 }
