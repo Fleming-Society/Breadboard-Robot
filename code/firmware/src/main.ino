@@ -2,152 +2,289 @@
 #include <WebServer.h>
 #include <WebSocketsServer.h>
 #include <ESP32Servo.h>
+#include <Preferences.h>
 
-// WiFi credentials
-const char* ssid     = "";
-const char* password = "";
+// ==== Function Prototypes ====
+void stopMotors();
+void sendServoCommand(uint8_t cmd);
+void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length);
+float readDistance();
+void checkButton();
+void handleDistanceMode();
+void handleLineFollowMode();
 
-// HTTP server on port 80
-WebServer       server(80);
-// WebSocket server on port 81
+// ==== WiFi Credentials ====
+const char* ssid     = "YungHub";
+const char* password = "yungyung";
+
+// ==== Pin Definitions ====
+const int SERVO_LEFT_PIN   = D0;
+const int SERVO_RIGHT_PIN  = D1;
+const int SR04_TRIG_PIN    = D3;
+const int SR04_ECHO_PIN    = D2;
+const int BUTTON_PIN       = D4;  // Active-HIGH pushbutton
+
+// ==== Servo Setup ====
+Servo servoLeft;
+Servo servoRight;
+
+// ==== Calibration Preferences ====
+Preferences prefs;
+int leftOffset  = 0;
+int rightOffset = 0;
+
+// ==== Servo Positions ====
+const int SERVO_CENTER = 90;
+const int SERVO_FASTF  = 135;
+const int SERVO_FASTB  = 45;
+
+inline int posCenter(int offset) { return SERVO_CENTER + offset; }
+inline int posFastF (int offset) { return SERVO_FASTF  + offset; }
+inline int posFastB (int offset) { return SERVO_FASTB  + offset; }
+
+// ==== Modes ====
+enum Mode { MANUAL = 0, DISTANCE = 1, LINE_FOLLOW = 2 };
+Mode currentMode = MANUAL;
+const char* modeNames[] = { "MANUAL", "DISTANCE", "LINE FOLLOW" };
+
+// ==== Timing ====
+unsigned long lastButtonPress = 0;
+const unsigned long debounceDelay = 300;
+unsigned long lastSensorTime = 0;
+const unsigned long sensorInterval = 200;
+#define SOUND_SPEED 0.034
+#define ECHO_TIMEOUT 30000
+
+int turnDirection = 0;
+
+// ==== Web Interfaces ====
+WebServer server(80);
 WebSocketsServer webSocket(81);
 
-// Continuous-servo pin definitions
-const int SERVO1_PIN = 0;  // Front servo
-const int SERVO2_PIN = 1;  // Back servo
-
-// Calibration: adjust these neutral pulses until servos reliably stop
-int neutralPulse1 = 1500;
-int neutralPulse2 = 1500;
-
-Servo servo1;
-Servo servo2;
-
-// Send pulses based on command
-// 1 = forward, 2 = backward, 3 = turn left, 4 = turn right, 0 = stop
-void sendServoCommand(uint8_t cmd) {
-  int pulse1 = neutralPulse1;
-  int pulse2 = neutralPulse2;
-
-  switch (cmd) {
-    case 1: // forward
-      pulse1 += 200;
-      pulse2 += 200;
-      break;
-    case 2: // backward
-      pulse1 -= 200;
-      pulse2 -= 200;
-      break;
-    case 3: // turn left
-      pulse1 -= 200;
-      pulse2 += 200;
-      break;
-    case 4: // turn right
-      pulse1 += 200;
-      pulse2 -= 200;
-      break;
-    default: // stop
-      break;
-  }
-
-  servo1.writeMicroseconds(pulse1);
-  servo2.writeMicroseconds(pulse2);
-}
-
-// HTML page with reliable '0' on release
+// ==== HTML Page ====
 const char* htmlPage = R"rawliteral(
 <!DOCTYPE html>
 <html>
 <head>
   <title>Omni Directional Robot Control</title>
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <link rel="stylesheet" href="https://raw.flemingsociety.com/robot/style.css">
+  <link rel="stylesheet" type="text/css" href="https://raw.flemingsociety.com/robot/style.css">
 </head>
 <body>
   <div class="logo-container">
-    <img src="https://raw.flemingsociety.com/logo.png" alt="Logo">
+    <img src="https://raw.flemingsociety.com/logo.png" alt="Fleming Society Logo">
   </div>
   <div class="container">
-    <h1>Omni Control</h1>
-    <div class="row"><button onmousedown="send(1)" onmouseup="send(0)" ontouchstart="send(1)" ontouchend="send(0)">&#8679;</button></div>
+    <h1>Omni Directional Robot Control</h1>
+    <p>Mode: <span id="modeName">MANUAL</span></p>
     <div class="row">
-      <button onmousedown="send(3)" onmouseup="send(0)" ontouchstart="send(3)" ontouchend="send(0)">&#8678;</button>
-      <div class="spacer"></div>
-      <button onmousedown="send(4)" onmouseup="send(0)" ontouchstart="send(4)" ontouchend="send(0)">&#8680;</button>
+      <button id="btnUp"    onmousedown="buttonPress('1')" onmouseup="buttonRelease()" ontouchstart="buttonPress('1')" ontouchend="buttonRelease()">&#8679;</button>
     </div>
-    <div class="row"><button onmousedown="send(2)" onmouseup="send(0)" ontouchstart="send(2)" ontouchend="send(0)">&#8681;</button></div>
+    <div class="row">
+      <button id="btnLeft"  onmousedown="buttonPress('3')" onmouseup="buttonRelease()" ontouchstart="buttonPress('3')" ontouchend="buttonRelease()">&#8678;</button>
+      <div class="spacer"></div>
+      <button id="btnRight" onmousedown="buttonPress('4')" onmouseup="buttonRelease()" ontouchstart="buttonPress('4')" ontouchend="buttonRelease()">&#8680;</button>
+    </div>
+    <div class="row">
+      <button id="btnDown"  onmousedown="buttonPress('2')" onmouseup="buttonRelease()" ontouchstart="buttonPress('2')" ontouchend="buttonRelease()">&#8681;</button>
+    </div>
   </div>
+  <script src="https://raw.flemingsociety.com/robot/script.js"></script>
   <script>
-    const ws = new WebSocket(`ws://${location.hostname}:81/`);
-    function send(cmd) { ws.send(cmd); }
-    window.addEventListener('load', () => {
-      document.querySelectorAll('button').forEach(b => {
-        b.addEventListener('mouseleave', () => ws.send(0));
-        b.addEventListener('touchcancel', () => ws.send(0));
-      });
-    });
+    var ws = new WebSocket('ws://' + location.hostname + ':81');
+    ws.onopen = function() { console.log('WebSocket open'); };
+    ws.onmessage = function(msg) { console.log('Received: ' + msg.data); };
+    function buttonPress(cmd) {
+      ws.send(cmd);
+    }
+    function buttonRelease() {
+      ws.send('0');
+    }
+    // Update mode display via serial-over-websocket or polling (optional)
   </script>
 </body>
 </html>
 )rawliteral";
 
-// Serve page
-void handleRoot() { server.send(200, "text/html", htmlPage); }
+// ==== Setup ====
+void setup() {
+  Serial.begin(115200);
 
-// WebSocket event
-void webSocketEvent(uint8_t num, WStype_t type, uint8_t *payload, size_t len) {
-  if (type == WStype_TEXT) {
-    char buf[4] = {};
-    memcpy(buf, payload, min(len, sizeof(buf)-1));
+  // Load calibration offsets
+  prefs.begin("servoCalib", false);
+  leftOffset  = prefs.getInt("leftOffset", 0);
+  rightOffset = prefs.getInt("rightOffset", 0);
+  Serial.printf("Loaded calibration: leftOffset=%d, rightOffset=%d\n", leftOffset, rightOffset);
+
+  // Calibration instructions
+  Serial.println("Calibration commands over Serial:");
+  Serial.println("  L/l : increase/decrease left offset");
+  Serial.println("  R/r : increase/decrease right offset");
+  Serial.println("  S   : save offsets to flash");
+  Serial.println("Press button to cycle modes.");
+
+  // Pin config
+  pinMode(BUTTON_PIN, INPUT);
+  pinMode(SR04_TRIG_PIN, OUTPUT);
+  pinMode(SR04_ECHO_PIN, INPUT);
+
+  // Attach servos
+  servoLeft.attach(SERVO_LEFT_PIN);
+  servoRight.attach(SERVO_RIGHT_PIN);
+  stopMotors();
+
+  // Connect to WiFi
+  WiFi.begin(ssid, password);
+  Serial.print("Connecting to WiFi");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500); Serial.print('.');
+  }
+  Serial.printf("\nConnected! IP=%s\n", WiFi.localIP().toString().c_str());
+
+  // Web services
+  server.on("/", []() { server.send(200, "text/html", htmlPage); });
+  server.begin();
+  webSocket.begin();
+  webSocket.onEvent(webSocketEvent);
+}
+
+// ==== Loop ====
+void loop() {
+  server.handleClient();
+  webSocket.loop();
+  checkButton();
+
+  // Serial-based calibration input
+  if (Serial.available()) {
+    char c = Serial.read();
+    bool changed = false;
+    switch (c) {
+      case 'L': leftOffset++; changed = true; break;
+      case 'l': leftOffset--; changed = true; break;
+      case 'R': rightOffset++; changed = true; break;
+      case 'r': rightOffset--; changed = true; break;
+      case 'S':
+        prefs.putInt("leftOffset", leftOffset);
+        prefs.putInt("rightOffset", rightOffset);
+        Serial.println("Calibration saved.");
+        break;
+    }
+    if (changed) {
+      Serial.printf("Offsets updated: left=%d, right=%d\n", leftOffset, rightOffset);
+      sendServoCommand(0);
+    }
+  }
+
+  switch (currentMode) {
+    case DISTANCE:
+      handleDistanceMode();
+      break;
+    case MANUAL:
+      // Manual handled via WebSocket events
+      break;
+    case LINE_FOLLOW:
+      handleLineFollowMode();
+      break;
+  }
+}
+
+// ==== Handle Pushbutton ====
+void checkButton() {
+  static bool lastState = LOW;
+  bool currentState = digitalRead(BUTTON_PIN);
+  if (currentState == HIGH && lastState == LOW && millis() - lastButtonPress > debounceDelay) {
+    currentMode = static_cast<Mode>((currentMode + 1) % 3);
+    Serial.printf("Mode changed to: %s\n", modeNames[currentMode]);
+    stopMotors();
+    lastButtonPress = millis();
+  }
+  lastState = currentState;
+}
+
+// ==== Distance Mode ====
+void handleDistanceMode() {
+  unsigned long now = millis();
+  if (now - lastSensorTime >= sensorInterval) {
+    lastSensorTime = now;
+    float distance = readDistance();
+    Serial.printf("Distance: %.2f cm\n", distance);
+    if (distance > 0 && distance < 5.0) {
+      // Too close: turn
+      if (turnDirection == 0) {
+        servoLeft.write(posFastB(leftOffset));
+        servoRight.write(posFastF(rightOffset));
+        Serial.println("← Turning LEFT");
+      } else {
+        servoLeft.write(posFastF(leftOffset));
+        servoRight.write(posFastB(rightOffset));
+        Serial.println("→ Turning RIGHT");
+      }
+    } else if (distance > 10.0) {
+      servoLeft.write(posFastF(leftOffset));
+      servoRight.write(posFastF(rightOffset));
+      Serial.println("↑ Moving FORWARD");
+      turnDirection = random(0, 2);
+    } else {
+      stopMotors();
+      Serial.println("Distance: No echo / too close");
+    }
+  }
+}
+
+// ==== Line Follow Mode (placeholder) ====
+void handleLineFollowMode() {
+  // TODO: Implement line following
+}
+
+// ==== WebSocket Events ====
+void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length) {
+  if (type == WStype_TEXT && currentMode == MANUAL) {
+    char buf[4] = {0};
+    memcpy(buf, payload, min(length, sizeof(buf)-1));
     uint8_t cmd = atoi(buf);
     sendServoCommand(cmd);
   }
 }
 
-void setup() {
-  Serial.begin(115200);
-  // Instructions for calibration
-  Serial.println("Servo calibration mode:\n  w/s: adjust both neutrals\n  a/z: front (servo1)\n  d/c: back (servo2)\n  After tuning, power cycle or press any control button.");
-  Serial.printf("Neutral1=%d, Neutral2=%d\n", neutralPulse1, neutralPulse2);
-
-  // WiFi
-  WiFi.begin(ssid, password);
-  Serial.print("Connecting");
-  while (WiFi.status() != WL_CONNECTED) { delay(500); Serial.print('.'); }
-  Serial.printf("\nConnected: %s\n", WiFi.localIP().toString().c_str());
-
-  // HTTP + WS
-  server.on("/", handleRoot);
-  server.begin();
-  webSocket.begin(); webSocket.onEvent(webSocketEvent);
-
-  // Setup servos
-  servo1.setPeriodHertz(50);
-  servo2.setPeriodHertz(50);
-  servo1.attach(SERVO1_PIN, 500, 2500);
-  servo2.attach(SERVO2_PIN, 500, 2500);
-
-  // Initial stop
-  sendServoCommand(0);
+// ==== Servo Control ====
+void sendServoCommand(uint8_t cmd) {
+  switch (cmd) {
+    case 1: 
+      servoLeft.write(posFastF(leftOffset));
+      servoRight.write(posFastF(rightOffset));
+      break;
+    case 2: 
+      servoLeft.write(posFastB(leftOffset));
+      servoRight.write(posFastB(rightOffset));
+      break;
+    case 3: 
+      servoLeft.write(posFastB(leftOffset));
+      servoRight.write(posFastF(rightOffset));
+      break;
+    case 4: 
+      servoLeft.write(posFastF(leftOffset));
+      servoRight.write(posFastB(rightOffset));
+      break;
+    default:
+      stopMotors();
+      break;
+  }
 }
 
-void loop() {
-  server.handleClient();
-  webSocket.loop();
+// ==== Stop Motors ====
+void stopMotors() {
+  servoLeft.write(posCenter(leftOffset));
+  servoRight.write(posCenter(rightOffset));
+}
 
-  // Allow serial-based neutral calibration
-  if (Serial.available()) {
-    char c = Serial.read();
-    switch (c) {
-      case 'w': neutralPulse1++; neutralPulse2++; break;
-      case 's': neutralPulse1--; neutralPulse2--; break;
-      case 'a': neutralPulse1++; break;
-      case 'z': neutralPulse1--; break;
-      case 'd': neutralPulse2++; break;
-      case 'c': neutralPulse2--; break;
-      default: break;
-    }
-    Serial.printf("Neutral1=%d, Neutral2=%d\n", neutralPulse1, neutralPulse2);
-    sendServoCommand(0);
-  }
+// ==== Read Distance Sensor ====
+float readDistance() {
+  digitalWrite(SR04_TRIG_PIN, LOW);
+  delayMicroseconds(2);
+  digitalWrite(SR04_TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(SR04_TRIG_PIN, LOW);
+  long duration = pulseInLong(SR04_ECHO_PIN, HIGH, ECHO_TIMEOUT);
+  if (duration == 0) return -1.0;
+  return duration * SOUND_SPEED / 2;
 }
