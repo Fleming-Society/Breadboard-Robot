@@ -186,25 +186,35 @@ void handleDistanceMode() {
   lastSensorTime = now;
   float distance = readDistance();
   Serial.printf("Distance: %.2f cm\n", distance);
-
-  if (distance > 0 && distance < 5.0) {
+  //Serial.printf("Turn Direction %d", turnDirection);
+  
+  if (distance > 0 && distance < 30.0) {
     if (turnDirection == 0) {
       // turn left
-      servoLeft.write(posFastB(leftOffset));
-      servoRight.write(posFastF(rightOffset));
+            Serial.printf("Turning Left");
+      //servoLeft.write(posFastB(leftOffset));
+  servoRight.write(posCenter(rightOffset));
+  servoLeft.write(posFastB(leftOffset));
+      prevrandom=LOW;
     } else {
       // turn right
-      servoLeft.write(posFastF(leftOffset));
-      servoRight.write(posFastB(rightOffset));
+      Serial.printf("Turning Right");
+            servoRight.write(posFastF(rightOffset));
+        servoLeft.write(posCenter(leftOffset));
+     
+      //servoRight.write(posFastB(rightOffset));
+        
+      prevrandom=LOW;
     }
-  } else if (distance > 10.0) {
+  } 
+  
+  else {
+    if (prevrandom==LOW){turnDirection = random(0, 2); prevrandom=HIGH; Serial.printf("Turn Direction Set %d", turnDirection);}
     // forward
     servoLeft.write(posFastF(leftOffset));
-    servoRight.write(posFastF(rightOffset));
-    turnDirection = random(0, 2);
-  } else {
-    stopMotors();
-  }
+    servoRight.write(posFastB(rightOffset));
+    
+  } 
 }
 
 // ==== Read Distance from SR04 ====
