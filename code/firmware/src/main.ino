@@ -16,6 +16,10 @@ constexpr int PIN_SERVO_RIGHT  = D1;
 constexpr int PIN_TRIG         = D2;
 constexpr int PIN_ECHO         = D3;
 constexpr int PIN_BUTTON       = D4;  // Active-HIGH
+constexpr int LEFT_S           = D5;
+constexpr int MIDDLE_S         = D6;
+constexpr int RIGHT_S          = D7;
+
 
 // === Calibration ===
 Preferences prefs;
@@ -89,6 +93,7 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t length)
 float readDistanceCM();
 void checkModeButton();
 void handleDistanceMode();
+void lineFollowing();
 
 void setup() {
   Serial.begin(115200);
@@ -129,6 +134,7 @@ void loop() {
   wsServer.loop();
   checkModeButton();
   if (currentMode == DISTANCE) handleDistanceMode();
+  if (currentMode == LINE_FOLLOW) lineFollowing();
 
   // serial calibration
   if (Serial.available()) {
@@ -207,4 +213,58 @@ void spinMotor(const String& cmd) {
 void stopMotors() {
   servoLeft.write(centerAngle(leftOffset));
   servoRight.write(centerAngle(rightOffset));
+}
+
+void lineFollowing(){
+  int left = digitalRead(LEFT_S);
+  int middle = digitalRead(MIDDLE_S);
+  int right = digitalRead(RIGHT_S);
+
+  // used for backtracking
+  static bool lost = false;
+  // if any of the sensors find the line, it is not lost
+  if(left || middle || right) lost = false;
+
+  if(!left && middle && !right){
+    // forward
+    spinMotor("forward");
+  }
+  else{
+    if(left && middle && right){
+      // stop
+      stopMotors();
+    }
+    else if(!left && !middle && !right){
+      // if its the first time all sensors lose, go backwards
+      if(!lost){
+        spinMotor("backward");
+        lost = true;
+      }
+      else{
+        // stop on the second time
+        stopMotors();
+      }
+    }
+    else if(left){
+      // turn left
+      servoLeft.write(75);
+      servoRight.write(75);
+    }
+    else if(right){
+      servoLeft.write(105);
+      servoRight.write(105);
+    }
+  }
+  
+
+  Serial.print("left:");
+  Serial.print(left);
+  
+  Serial.print("  middle");
+  Serial.print(middle);
+
+  
+  Serial.print("  right:");
+  Serial.println(right);
+  delay(150);
 }
