@@ -63,7 +63,7 @@ const char* htmlPage = R"rawliteral(
 <head>
   <title>Omni Directional Robot Control</title>
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <link rel="stylesheet" href="https://raw.flemingsociety.com/robot/style.css">
+  <link rel="stylesheet" href="https://raw.githubusercontent.com/Fleming-Society/Breadboard-Robot/refs/heads/main/code/web/style.css">
 </head>
 <body>
   <div class="logo-container">
@@ -81,7 +81,7 @@ const char* htmlPage = R"rawliteral(
   <div class="row">
     <button onmousedown="buttonPress('backward')" onmouseup="buttonRelease()" ontouchstart="buttonPress('backward')" ontouchend="buttonRelease()">&#8681;</button>
   </div>
-  <script src="https://raw.flemingsociety.com/robot/script.js"></script>
+  <script src="https://raw.githubusercontent.com/Fleming-Society/Breadboard-Robot/refs/heads/main/code/web/script.js"></script>
 </body>
 </html>
 )rawliteral";
