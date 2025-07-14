@@ -7,8 +7,8 @@
 #include <Preferences.h>
 
 // === Wi-Fi ===
-const char* SSID     = "YungHub";
-const char* PASSWORD = "yungyung";
+const char* SSID     = "REPLACE THIS WITH YOUR HOTSPOT NAME";
+const char* PASSWORD = "REPLACE THIS WITH YOUR HOTSPOT PASSWORD";
 
 // === Pins ===
 constexpr int PIN_SERVO_LEFT   = D0;
@@ -28,8 +28,8 @@ int rightOffset = 0;
 
 // === Servo angles ===
 constexpr int ANGLE_CENTER = 90;
-constexpr int ANGLE_FASTF  = 135;
-constexpr int ANGLE_FASTB  = 45;
+constexpr int ANGLE_FASTF  = 97;
+constexpr int ANGLE_FASTB  = 83;
 inline int centerAngle(int o){ return ANGLE_CENTER + o; }
 inline int forwardAngle(int o){ return ANGLE_FASTF  + o; }
 inline int backwardAngle(int o){ return ANGLE_FASTB + o; }
@@ -63,7 +63,7 @@ const char* htmlPage = R"rawliteral(
 <head>
   <title>Omni Directional Robot Control</title>
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <link rel="stylesheet" href="https://raw.githubusercontent.com/Fleming-Society/Breadboard-Robot/refs/heads/main/code/web/style.css">
+  <link rel="stylesheet" href="https://raw.flemingsociety.com/robot/style.css">
 </head>
 <body>
   <div class="logo-container">
@@ -81,7 +81,7 @@ const char* htmlPage = R"rawliteral(
   <div class="row">
     <button onmousedown="buttonPress('backward')" onmouseup="buttonRelease()" ontouchstart="buttonPress('backward')" ontouchend="buttonRelease()">&#8681;</button>
   </div>
-  <script src="https://raw.githubusercontent.com/Fleming-Society/Breadboard-Robot/refs/heads/main/code/web/script.js"></script>
+  <script src="https://raw.flemingsociety.com/robot/script.js"></script>
 </body>
 </html>
 )rawliteral";
@@ -108,6 +108,11 @@ void setup() {
   pinMode(PIN_BUTTON, INPUT);
   pinMode(PIN_TRIG, OUTPUT);
   pinMode(PIN_ECHO, INPUT);
+
+  pinMode(LEFT_S,   INPUT);
+  pinMode(MIDDLE_S, INPUT);
+  pinMode(RIGHT_S,  INPUT);
+
 
   servoLeft.attach(PIN_SERVO_LEFT);
   servoRight.attach(PIN_SERVO_RIGHT);
@@ -163,7 +168,7 @@ void checkModeButton() {
   bool curr = digitalRead(PIN_BUTTON);
   if (curr && !last && millis()-lastButtonPress>DEBOUNCE_MS) {
     currentMode = Mode((currentMode+1)%3);
-    Serial.printf("Mode → %s\n", modeNames[currentMode]);
+    Serial.printf("Mode â†’ %s\n", modeNames[currentMode]);
     stopMotors();
     lastButtonPress = millis();
   }
@@ -210,61 +215,49 @@ void spinMotor(const String& cmd) {
   else                        stopMotors();
 }
 
+
 void stopMotors() {
   servoLeft.write(centerAngle(leftOffset));
   servoRight.write(centerAngle(rightOffset));
 }
 
-void lineFollowing(){
-  int left = digitalRead(LEFT_S);
+
+
+
+void lineFollowing() {
+  // ---- non-blocking 100 ms timing ----
+  static unsigned long lastRun = 0;
+  if (millis() - lastRun < 100) return;
+  lastRun = millis();
+
+  // ---- read sensors: 1 = on-line, 0 = off-line ----
+  int left   = digitalRead(LEFT_S);
   int middle = digitalRead(MIDDLE_S);
-  int right = digitalRead(RIGHT_S);
+  int right  = digitalRead(RIGHT_S);
 
-  // used for backtracking
-  static bool lost = false;
-  // if any of the sensors find the line, it is not lost
-  if(left || middle || right) lost = false;
+  // ---- compute â€œerrorâ€: left = -1, center = 0, right = +1 ----
+  int error = 0;
+  if (left)   error -= 1;
+  if (right)  error += 1;
+  
+  // remember last non-zero for recovery
+  static int lastError = 0;
+  if (error != 0) lastError = error;
 
-  if(!left && middle && !right){
-    // forward
-    spinMotor("forward");
+  // ---- recovery if completely lost ----
+  if (!left && !middle && !right) {
+    if (lastError < 0)          spinMotor("turnRight");
+    else if (lastError > 0)     spinMotor("turnLeft");
+    else                        spinMotor("backward");
   }
-  else{
-    if(left && middle && right){
-      // stop
-      stopMotors();
-    }
-    else if(!left && !middle && !right){
-      // if its the first time all sensors lose, go backwards
-      if(!lost){
-        spinMotor("backward");
-        lost = true;
-      }
-      else{
-        // stop on the second time
-        stopMotors();
-      }
-    }
-    else if(left){
-      // turn left
-      servoLeft.write(75);
-      servoRight.write(75);
-    }
-    else if(right){
-      servoLeft.write(105);
-      servoRight.write(105);
-    }
+  // ---- normal following ----
+  else {
+    if (error == 0)             spinMotor("forward");
+    else if (error < 0)         spinMotor("turnLeft");
+    else                        spinMotor("turnRight");
   }
-  
 
-  Serial.print("left:");
-  Serial.print(left);
-  
-  Serial.print("  middle");
-  Serial.print(middle);
-
-  
-  Serial.print("  right:");
-  Serial.println(right);
-  delay(150);
+  // ---- debug print ----
+  Serial.printf("L:%d  M:%d  R:%d   err=%d\n",
+                left, middle, right, error);
 }
